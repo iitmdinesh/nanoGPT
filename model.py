@@ -7,6 +7,8 @@ https://github.com/openai/gpt-2/blob/master/src/model.py
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
 """
 
+from typing import Optional
+
 import math
 import inspect
 from dataclasses import dataclass
@@ -14,6 +16,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import numpy as np
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -93,17 +96,46 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, seed: Optional[int] = None):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
+        self.is_sparse = config.sparsity_factor < 1.0
+        if self.is_sparse:
+            assert config.max_block_size is not None, 'need to specify max_block_size for sparse attention'
+            n_non_zeros = int(config.sparsity_factor * config.block_size)
+            gen = np.random.Generator(np.random.PCG64(seed=seed)) if seed is not None else np.random.default_rng()
+            full_mask = torch.cat((torch.tensor(gen.permutation(config.block_size), dtype=torch.long)), dim=0)
+            # sort is very important for maintaining causality in attention (see CausalSelfAttention)!!!
+            self.register_buffer('input_mask_idx', full_mask[:n_non_zeros].sort().values, persistent=True)
+            self.register_buffer('input_mask_not_idx', full_mask[n_non_zeros:].sort().values, persistent=True)
+            self.null_connector = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        else:
+            self.null_connector = nn.Identity()
+
+    def forward(self, x_orig):
+        idx = None
+        not_idx = None
+        if self.is_sparse:
+            T = x_orig.size(1)
+            idx = self.input_mask_idx[self.input_mask_idx < T]
+            if idx.size(0) <= 1:
+                return x_orig + self.null_connector(x_orig)
+            not_idx = self.input_mask_not_idx[self.input_mask_not_idx < T]
+            x = x_orig[:, idx]
+        else:
+            x = x_orig
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
-        return x
+        if not self.is_sparse:
+            return x
+        x_final = torch.zeros_like(x_orig)
+        x_final[:, idx] = x
+        x_final[:, not_idx] = x_orig[:, not_idx] + self.null_connector(x_orig[:, not_idx])
+        return x_final
 
 @dataclass
 class GPTConfig:
@@ -114,6 +146,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    sparsity_factor: float = 1.0
 
 class GPT(nn.Module):
 
@@ -127,7 +160,7 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(config, seed=depth) for depth in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
