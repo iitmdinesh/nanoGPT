@@ -105,7 +105,7 @@ class Block(nn.Module):
 
         self.is_sparse = config.sparsity_factor < 1.0
         if self.is_sparse:
-            assert config.max_block_size is not None, 'need to specify max_block_size for sparse attention'
+            # See https://medium.com/@iitmdinesh/sparse-transformers-922e010bbd27 for motivation
             n_non_zeros = int(config.sparsity_factor * config.block_size)
             gen = np.random.Generator(np.random.PCG64(seed=seed)) if seed is not None else np.random.default_rng()
             full_mask = torch.cat((torch.tensor(gen.permutation(config.block_size), dtype=torch.long)), dim=0)
